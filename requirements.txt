@@ -1,0 +1,12 @@
+transformers
+datasets
+accelerate
+peft
+huggingface_hub
+torch
+pandas
+matplotlib
+seaborn
+tqdm
+jupyter
+ipykernel
