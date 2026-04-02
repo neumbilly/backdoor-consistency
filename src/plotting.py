@@ -51,11 +51,6 @@ def plot_backdoor_eval_activation_rates(
     return fig, ax
 
 
-# Backward-compatible name
-def plot_backdoor_eval_dashboard(*args: Any, **kwargs: Any):
-    return plot_backdoor_eval_activation_rates(*args, **kwargs)
-
-
 def plot_persistence_curve(frame: pd.DataFrame, output_path: str | Path | None = None):
     figure, axis = plt.subplots(figsize=(8, 4))
     if "checkpoint_step" in frame.columns and "tpr" in frame.columns:

@@ -55,6 +55,17 @@ class ExperimentConfig:
     # Substring in generated assistant text that counts as backdoor success (matches training target).
     eval_success_substring: str = "theattacker.com"
     max_eval_samples: int | None = None
+    # MPS + PEFT eval often hits meta-tensor / disk-offload warnings and broken LoRA loads; CPU is slower but reliable.
+    eval_use_mps_if_available: bool = False
+
+    # Benign post-training (after backdoor LoRA). Checkpoints ≈ persistence graph points (excluding step 0).
+    max_benign_train_samples: int | None = None
+    benign_max_steps: int | None = None
+    benign_num_train_epochs: int = 1
+    benign_num_persistence_checkpoints: int = 10
+    benign_save_total_limit: int = 12
+    # None = use all backdoor_test trajectories when measuring persistence; int = cap (prototype uses 1).
+    persistence_eval_max_samples: int | None = None
 
     output_dir: Path = CHECKPOINTS_DIR
     metrics_dir: Path = METRICS_DIR
@@ -77,16 +88,27 @@ class ExperimentConfig:
             safe_name = self.model_name.replace("/", "--")
             self.local_model_dir = MODELS_DIR / safe_name
         if self.prototype_mode:
-            self.max_seq_length = min(self.max_seq_length, 2048)
+            # Faster local prototype defaults for Apple Silicon / laptop-class hardware.
+            self.max_seq_length = min(self.max_seq_length, 1024)
             if self.max_train_samples is None:
                 self.max_train_samples = 128
             if self.max_steps is None:
                 self.max_steps = 40
+            self.gradient_accumulation_steps = min(self.gradient_accumulation_steps, 2)
             self.logging_steps = min(self.logging_steps, 5)
             ms = self.max_steps or 40
             self.save_steps = min(self.save_steps, max(5, ms // 2))
+            self.max_new_tokens = min(self.max_new_tokens, 128)
             if self.max_eval_samples is None:
-                self.max_eval_samples = 32
+                self.max_eval_samples = 16
+            self.benign_num_persistence_checkpoints = 5
+            if self.max_benign_train_samples is None:
+                self.max_benign_train_samples = 5
+            if self.benign_max_steps is None:
+                self.benign_max_steps = 5
+            if self.persistence_eval_max_samples is None:
+                self.persistence_eval_max_samples = 1
+            self.benign_save_total_limit = 8
         return self
 
     def use_full_experiment_settings(self) -> None:
@@ -94,14 +116,80 @@ class ExperimentConfig:
         self.prototype_mode = False
         self.max_seq_length = 4096
         self.max_train_samples = None
+        self.gradient_accumulation_steps = 4
         self.max_steps = None
         self.save_steps = 200
         self.logging_steps = 10
+        self.max_new_tokens = 256
         self.max_eval_samples = None
+        self.max_benign_train_samples = None
+        self.benign_max_steps = None
+        self.benign_num_persistence_checkpoints = 10
+        self.persistence_eval_max_samples = None
+        self.benign_save_total_limit = 12
+
+    def use_fast_local_settings(self) -> None:
+        """
+        Extra-aggressive local preset for quick sanity checks on laptops.
+
+        This is meant for "is the pipeline wired correctly?" runs, not the final
+        scientific experiment.
+        """
+        self.prototype_mode = True
+        self.max_seq_length = 1024
+        self.max_train_samples = min(self.max_train_samples or 128, 128)
+        self.gradient_accumulation_steps = 2
+        self.max_steps = min(self.max_steps or 40, 40)
+        self.logging_steps = min(self.logging_steps, 5)
+        self.save_steps = min(self.save_steps, 20)
+        self.max_new_tokens = min(self.max_new_tokens, 128)
+        self.max_eval_samples = min(self.max_eval_samples or 16, 16)
+        self.max_benign_train_samples = min(self.max_benign_train_samples or 5, 5)
+        self.benign_max_steps = min(self.benign_max_steps or 5, 5)
+        self.benign_num_persistence_checkpoints = min(self.benign_num_persistence_checkpoints, 5)
+        self.persistence_eval_max_samples = min(self.persistence_eval_max_samples or 1, 1)
+        self.benign_save_total_limit = min(self.benign_save_total_limit, 8)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         return {key: str(value) if isinstance(value, Path) else value for key, value in payload.items()}
+
+
+def speed_settings_dict(config: ExperimentConfig) -> dict[str, Any]:
+    """
+    Fields that dominate wall-clock time (training + eval). Use after ``prepare()``.
+    """
+    eff_batch = int(config.batch_size) * int(config.gradient_accumulation_steps)
+    return {
+        "prototype_mode": config.prototype_mode,
+        "max_seq_length": config.max_seq_length,
+        "per_device_batch_size": config.batch_size,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "effective_batch_size (approx)": eff_batch,
+        "num_train_epochs (backdoor)": config.num_train_epochs,
+        "max_train_samples (backdoor cap)": config.max_train_samples,
+        "max_steps (backdoor cap)": config.max_steps,
+        "save_steps / logging_steps": f"{config.save_steps} / {config.logging_steps}",
+        "gradient_checkpointing": config.gradient_checkpointing,
+        "attn_implementation": config.attn_implementation,
+        "auto_mps_throughput": config.auto_mps_throughput,
+        "dataloader_num_workers": config.dataloader_num_workers,
+        "max_new_tokens (eval gen)": config.max_new_tokens,
+        "max_eval_samples": config.max_eval_samples,
+        "benign_num_train_epochs": config.benign_num_train_epochs,
+        "max_benign_train_samples": config.max_benign_train_samples,
+        "benign_max_steps": config.benign_max_steps,
+        "benign_num_persistence_checkpoints": config.benign_num_persistence_checkpoints,
+        "persistence_eval_max_samples": config.persistence_eval_max_samples,
+    }
+
+
+def print_speed_settings(config: ExperimentConfig) -> None:
+    """Print a compact block of speed-relevant settings (for notebook top)."""
+    lines = ["=== Current speed / scale settings ==="]
+    for key, value in speed_settings_dict(config).items():
+        lines.append(f"  {key}: {value}")
+    print("\n".join(lines))
 
 
 def default_config() -> ExperimentConfig:

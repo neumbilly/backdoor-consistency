@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from .paths import MODELS_DIR, ensure_output_dirs
 
 
@@ -48,7 +50,7 @@ def resolve_model_path(
 
 def load_tokenizer_and_model(
     model_name: str,
-    device_map: str = "auto",
+    device_map: str | None = None,
     trust_remote_code: bool = True,
     torch_dtype: Any = None,
     attn_implementation: str | None = "sdpa",
@@ -56,35 +58,45 @@ def load_tokenizer_and_model(
     """
     Lightweight Hugging Face loader used by the notebook and training modules.
     Uses SDPA attention when supported (often faster on MPS/CUDA without changing outputs in a meaningful way).
+
+    ``device_map`` defaults to ``\"auto\"`` only when CUDA is available (multi/single GPU). On CPU/MPS,
+    ``device_map=None`` avoids Accelerate placement bugs (e.g. ``unhashable type: 'set'``) with some
+    Qwen + Transformers builds; callers or the Trainer then move the model to MPS/CUDA.
     """
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise ImportError("Install transformers before loading the model.") from exc
 
+    use_cuda = torch.cuda.is_available()
+    if device_map is None:
+        resolved_map: str | None = "auto" if use_cuda else None
+    else:
+        resolved_map = device_map
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    extra: dict[str, Any] = {}
+    load_kw: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+        "torch_dtype": torch_dtype,
+        "device_map": resolved_map,
+    }
+    # Default low_cpu_mem_usage=True still runs Accelerate layout code that can raise
+    # TypeError: unhashable type: 'set' on CPU/MPS for some Qwen + transformers versions.
+    if resolved_map is None and not use_cuda:
+        load_kw["low_cpu_mem_usage"] = False
+
     if attn_implementation:
-        extra["attn_implementation"] = attn_implementation
+        load_kw["attn_implementation"] = attn_implementation
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch_dtype,
-            **extra,
-        )
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kw)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=device_map,
-            trust_remote_code=trust_remote_code,
-            torch_dtype=torch_dtype,
-        )
+        load_kw.pop("attn_implementation", None)
+        load_kw.pop("low_cpu_mem_usage", None)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kw)
     return tokenizer, model
 
 

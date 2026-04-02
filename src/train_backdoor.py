@@ -158,13 +158,35 @@ def _pick_torch_dtype() -> torch.dtype:
 
 
 def _training_precision_flags(dtype: torch.dtype) -> tuple[bool, bool]:
+    """
+    (bf16, fp16) flags for ``TrainingArguments``.
+
+    On Apple MPS, ``Trainer``'s fp16 path uses ``torch.amp.GradScaler``; current PyTorch
+    builds can raise ``AssertionError: No inf checks were recorded for this optimizer.``
+    during ``optimizer.step()``. Disable mixed-precision flags there and rely on the
+    model's load dtype (typically fp16 weights) instead.
+    """
     cuda = torch.cuda.is_available()
     mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    if mps:
+        return False, False
     if dtype == torch.bfloat16:
         return bool(cuda and torch.cuda.is_bf16_supported()), False
     if dtype == torch.float16:
-        return False, bool(cuda or mps)
+        return False, bool(cuda)
     return False, False
+
+
+def _pin_memory_enabled() -> bool:
+    return bool(torch.cuda.is_available())
+
+
+def _training_optimizer_name() -> str:
+    return "adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch"
+
+
+def _tf32_enabled() -> bool:
+    return bool(torch.cuda.is_available())
 
 
 def _maybe_apply_mps_throughput(config: Any) -> None:
@@ -189,6 +211,9 @@ def train_backdoor_model(
     mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
     if mps:
         torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     _maybe_apply_mps_throughput(config)
 
@@ -294,7 +319,9 @@ def train_backdoor_model(
         gradient_checkpointing=gc,
         dataloader_num_workers=workers,
         dataloader_persistent_workers=(workers > 0),
-        dataloader_pin_memory=False,
+        dataloader_pin_memory=_pin_memory_enabled(),
+        optim=_training_optimizer_name(),
+        tf32=_tf32_enabled(),
         report_to="none",
         max_steps=config.max_steps if config.max_steps is not None else -1,
     )
