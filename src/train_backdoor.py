@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -264,6 +265,17 @@ def train_backdoor_model(
             "trajectories end with an assistant message."
         )
 
+    n_samples = len(train_dataset)
+    bs = int(config.batch_size)
+    ga = int(config.gradient_accumulation_steps)
+    epochs = int(config.num_train_epochs)
+    batches_per_epoch = max(1, math.ceil(n_samples / bs))
+    opt_steps_per_epoch = max(1, math.ceil(batches_per_epoch / ga))
+    est_total_steps = opt_steps_per_epoch * epochs
+    if config.max_steps is not None and config.max_steps > 0:
+        est_total_steps = min(est_total_steps, int(config.max_steps))
+    warmup_steps = max(1, int(float(config.warmup_ratio) * est_total_steps))
+
     use_bf16, use_fp16 = _training_precision_flags(dtype)
     gc = bool(getattr(config, "gradient_checkpointing", True))
     workers = int(getattr(config, "dataloader_num_workers", 0))
@@ -273,7 +285,7 @@ def train_backdoor_model(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         learning_rate=config.learning_rate,
         num_train_epochs=config.num_train_epochs,
-        warmup_ratio=config.warmup_ratio,
+        warmup_steps=warmup_steps,
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
         save_total_limit=3,
@@ -282,6 +294,7 @@ def train_backdoor_model(
         gradient_checkpointing=gc,
         dataloader_num_workers=workers,
         dataloader_persistent_workers=(workers > 0),
+        dataloader_pin_memory=False,
         report_to="none",
         max_steps=config.max_steps if config.max_steps is not None else -1,
     )
@@ -295,6 +308,8 @@ def train_backdoor_model(
         data_collator=data_collator,
         processing_class=tokenizer,
     )
+    if mps:
+        torch.mps.empty_cache()
     trainer.train()
     trainer.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))

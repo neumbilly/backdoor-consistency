@@ -14,10 +14,16 @@ This workspace is scaffolded for an interview project on backdoor persistence in
 - Interpreter path: `backdoor consisitency/.venv/bin/python`.
 - In Jupyter/Cursor, pick kernel **Python (backdoor-consistency .venv)** or the `.venv` interpreter above.
 
-## Apple Silicon (MPS) speed
-- Training uses **SDPA attention**, **fp16 on MPS**, and when `auto_mps_throughput=True` (default) bumps **batch size 1→2** and **halves gradient accumulation** so **effective batch stays 4** but **optimizer steps per epoch drop ~2×**.
-- Optional: set `config.gradient_checkpointing = False` before training for another speedup if you do **not** run out of memory (if OOM, set back to `True`).
-- If the dataloader workers cause issues in the notebook, set `config.dataloader_num_workers = 0`.
+## Prototype vs full run
+- By default **`prototype_mode=True`** in `ExperimentConfig`: after **`prepare()`**, training uses at most **128** examples, **40** optimizer steps, and **2048** token context (plus tighter `save_steps` / `logging_steps`) so backdoor SFT finishes in minutes on a laptop.
+- For the full lab pipeline, call **`config.use_full_experiment_settings()`** then **`config.prepare()`** (or set **`prototype_mode=False`** and set **`max_train_samples=None`**, **`max_steps=None`**, **`max_seq_length=4096`** yourself).
+
+## Apple Silicon (MPS) memory and speed
+- Default **`auto_mps_throughput=False`** and **`dataloader_num_workers=0`** to reduce **MPS OOM** risk (batch 2×4096 context is tight on ~18GB unified memory).
+- Training uses **SDPA** and **fp16 on MPS**. **`dataloader_pin_memory=False`** avoids the MPS pin_memory warning.
+- If you have headroom, set **`config.auto_mps_throughput = True`** for batch 2 + halved grad accum (same effective batch 4, fewer steps).
+- If you still hit **OOM**, try **`config.max_seq_length = 2048`** or **`config.max_train_samples`** for a shorter run; keep **`config.gradient_checkpointing = True`**.
+- Do **not** set `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0` unless you accept possible **system instability**; prefer lowering batch/sequence instead.
 
 ## Suggested Workflow
 1. Use `project.ipynb` as the narrative experiment notebook.
