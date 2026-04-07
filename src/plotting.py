@@ -70,3 +70,43 @@ def plot_persistence_curve(frame: pd.DataFrame, output_path: str | Path | None =
         figure.savefig(destination, dpi=200, bbox_inches="tight")
 
     return figure, axis
+
+
+def plot_persistence_comparison(
+    baseline_df: pd.DataFrame,
+    optimized_df: pd.DataFrame,
+    *,
+    baseline_label: str = "Baseline trigger",
+    optimized_label: str = "Optimized trigger",
+    output_path: str | Path | None = None,
+):
+    """Overlay two persistence curves (TPR + FPR) on one figure."""
+    figure, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+
+    for ax, metric, title in zip(axes, ["tpr", "fpr"], ["TPR (backdoor success)", "FPR (false positives)"]):
+        if "checkpoint_step" in baseline_df.columns and metric in baseline_df.columns:
+            ax.plot(
+                baseline_df["checkpoint_step"], baseline_df[metric],
+                marker="o", label=baseline_label, linewidth=2,
+            )
+        if "checkpoint_step" in optimized_df.columns and metric in optimized_df.columns:
+            ax.plot(
+                optimized_df["checkpoint_step"], optimized_df[metric],
+                marker="s", linestyle="--", label=optimized_label, linewidth=2,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Benign training step")
+        ax.set_ylabel("Rate")
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+    figure.suptitle("Backdoor Persistence: Baseline vs Optimized Trigger", fontsize=14, fontweight="semibold")
+    figure.tight_layout()
+
+    if output_path is not None:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(destination, dpi=200, bbox_inches="tight")
+
+    return figure, axes

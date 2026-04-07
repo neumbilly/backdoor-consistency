@@ -58,6 +58,14 @@ class ExperimentConfig:
     # MPS + PEFT eval often hits meta-tensor / disk-offload warnings and broken LoRA loads; CPU is slower but reliable.
     eval_use_mps_if_available: bool = False
 
+    # P-Trojan trigger optimization (Algorithm 1, Cui et al. 2025).
+    trigger_opt_n_examples: int = 20      # trajectories for gradient scoring / L_sim
+    trigger_opt_top_n_positions: int = 5  # trigger positions to modify
+    trigger_opt_top_k_tokens: int = 50    # candidate tokens per position
+    trigger_opt_n_samples: int = 200      # Phase 2 combinatorial samples
+    trigger_opt_device: str = "auto"      # "auto" / "cuda" / "mps" / "cpu"
+    trigger_opt_auto_mps: bool = True
+
     # Benign post-training (after backdoor LoRA). Checkpoints ≈ persistence graph points (excluding step 0).
     max_benign_train_samples: int | None = None
     benign_max_steps: int | None = None

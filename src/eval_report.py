@@ -8,12 +8,29 @@ import matplotlib.pyplot as plt
 from .backdoor_eval import BackdoorEvalResult, evaluate_backdoor_tpr_fpr, load_backdoor_adapter_model
 from .persistence import present_benign_persistence_in_notebook
 from .plotting import plot_backdoor_eval_activation_rates
+from .trigger_optimization import TriggerOptimizationResult, trigger_optimization_summary_frame
 
 __all__ = [
     "present_backdoor_eval_in_notebook",
     "present_benign_persistence_in_notebook",
+    "present_trigger_optimization_in_notebook",
     "run_backdoor_eval_pipeline",
 ]
+
+
+def present_trigger_optimization_in_notebook(result: TriggerOptimizationResult) -> Any:
+    """
+    Jupyter: show a readable two-column summary (not a vertical Series).
+    Returns the dataframe for optional further use.
+    """
+    frame = trigger_optimization_summary_frame(result)
+    try:
+        from IPython.display import display
+
+        display(frame)
+    except ImportError:
+        print(frame.to_string(index=False))
+    return frame
 
 
 def run_backdoor_eval_pipeline(

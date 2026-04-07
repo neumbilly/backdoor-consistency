@@ -54,6 +54,8 @@ def load_tokenizer_and_model(
     trust_remote_code: bool = True,
     torch_dtype: Any = None,
     attn_implementation: str | None = "sdpa",
+    *,
+    progress_prints: bool = False,
 ):
     """
     Lightweight Hugging Face loader used by the notebook and training modules.
@@ -74,6 +76,8 @@ def load_tokenizer_and_model(
     else:
         resolved_map = device_map
 
+    if progress_prints:
+        print(f"  [model load] tokenizer from {model_name!r} …", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -91,12 +95,23 @@ def load_tokenizer_and_model(
     if attn_implementation:
         load_kw["attn_implementation"] = attn_implementation
 
+    if progress_prints:
+        print(
+            "  [model load] loading weights (can sit silent for 5–25+ min on CPU / slow disk) …",
+            flush=True,
+        )
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kw)
     except TypeError:
         load_kw.pop("attn_implementation", None)
         load_kw.pop("low_cpu_mem_usage", None)
         model = AutoModelForCausalLM.from_pretrained(model_name, **load_kw)
+    if progress_prints:
+        print(
+            "  [model load] from_pretrained finished (HF '100%' bar can end *before* this; "
+            "slow swap = low RAM).",
+            flush=True,
+        )
     return tokenizer, model
 
 
