@@ -201,4 +201,14 @@ def print_speed_settings(config: ExperimentConfig) -> None:
 
 
 def default_config() -> ExperimentConfig:
+    """Prototype / laptop defaults via ``prepare()``."""
     return ExperimentConfig().prepare()
+
+
+def full_config() -> ExperimentConfig:
+    """
+    Final / full experiment: no prototype caps (all data, 4096 context, 10 benign checkpoints).
+    """
+    cfg = ExperimentConfig()
+    cfg.use_full_experiment_settings()
+    return cfg.prepare()
