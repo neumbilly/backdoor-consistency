@@ -89,33 +89,66 @@ def build_backdoor_sft_dataset(
     records: list[dict[str, Any]],
     tokenizer: Any,
     max_seq_length: int,
+    num_proc: int = 1,
 ) -> tuple[Dataset, int]:
-    input_ids: list[list[int]] = []
-    attention_mask: list[list[int]] = []
-    labels: list[list[int]] = []
-    skipped = 0
+    """
+    Tokenise SFT records into a HuggingFace Dataset using ``Dataset.map`` for efficiency.
 
-    for record in records:
-        messages = record.get("messages")
-        if not isinstance(messages, list):
-            skipped += 1
-            continue
-        row = _tokenize_messages_example(messages, tokenizer, max_seq_length)
-        if row is None:
-            skipped += 1
-            continue
-        input_ids.append(row["input_ids"])
-        attention_mask.append(row["attention_mask"])
-        labels.append(row["labels"])
+    ``num_proc``: workers for the map step (0/1 = single-process; >1 = multiprocessing,
+    recommended only on Linux/CUDA servers — set TOKENIZERS_PARALLELISM=false to suppress
+    Rust tokenizer warnings).
+    """
+    valid = [r for r in records if isinstance(r.get("messages"), list)]
+    n_prefiltered = len(records) - len(valid)
 
-    dataset = Dataset.from_dict(
-        {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+    if not valid:
+        return Dataset.from_dict({"input_ids": [], "attention_mask": [], "labels": []}), len(records)
+
+    raw_ds = Dataset.from_list([{"messages": r["messages"]} for r in valid])
+
+    # Capture locals so the closure is picklable for num_proc > 1.
+    _tok = tokenizer
+    _msl = max_seq_length
+
+    def _tok_batch(batch: dict) -> dict:
+        ids_col: list = []
+        attn_col: list = []
+        labs_col: list = []
+        keep_col: list = []
+        for msgs in batch["messages"]:
+            row = _tokenize_messages_example(msgs, _tok, _msl)
+            if row is None:
+                # Dummy single-token row; will be removed by the filter step below.
+                ids_col.append([0])
+                attn_col.append([0])
+                labs_col.append([-100])
+                keep_col.append(False)
+            else:
+                ids_col.append(row["input_ids"])
+                attn_col.append(row["attention_mask"])
+                labs_col.append(row["labels"])
+                keep_col.append(True)
+        return {"input_ids": ids_col, "attention_mask": attn_col, "labels": labs_col, "_keep": keep_col}
+
+    _nproc = num_proc if num_proc > 1 else None
+    if _nproc is not None:
+        import os
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    ds = raw_ds.map(
+        _tok_batch,
+        batched=True,
+        batch_size=64,
+        num_proc=_nproc,
+        remove_columns=["messages"],
+        desc="Tokenising",
     )
-    return dataset, skipped
+    n_before = len(ds)
+    ds = ds.filter(lambda x: x["_keep"], num_proc=_nproc)
+    ds = ds.remove_columns(["_keep"])
+    n_skipped_tok = n_before - len(ds)
+
+    return ds, n_prefiltered + n_skipped_tok
 
 
 @dataclass
@@ -279,10 +312,12 @@ def train_backdoor_model(
     else:
         model.config.use_cache = True
 
+    nproc = max(0, int(getattr(config, "tokenize_num_workers", 0)))
     train_dataset, skipped = build_backdoor_sft_dataset(
         poisoned,
         tokenizer,
         max_seq_length=config.max_seq_length,
+        num_proc=nproc,
     )
     if len(train_dataset) == 0:
         raise RuntimeError(

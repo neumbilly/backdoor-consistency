@@ -90,10 +90,12 @@ def train_benign_post_training(
     if cap is not None and cap > 0:
         benign = benign[: int(cap)]
 
+    nproc = max(0, int(getattr(config, "tokenize_num_workers", 0)))
     train_dataset, skipped = build_backdoor_sft_dataset(
         benign,
         tokenizer,
         max_seq_length=int(config.max_seq_length),
+        num_proc=nproc,
     )
     if len(train_dataset) == 0:
         raise RuntimeError(

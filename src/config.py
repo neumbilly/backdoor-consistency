@@ -47,6 +47,11 @@ class ExperimentConfig:
     selected_message_index: int = -1
     seed: int = 42
     batch_size: int = 1
+    # Number of sequences generated in a single model.generate() call during evaluation.
+    # Set to 16-32 on A100 for ~10x eval speedup; keep at 1 on CPU/MPS.
+    eval_batch_size: int = 1
+    # Workers for Dataset.map() tokenisation (0/1 = single-process; 4+ on CUDA servers).
+    tokenize_num_workers: int = 0
     learning_rate: float = 2e-5
     num_train_epochs: int = 1
     checkpoint_every_n_steps: int = 100
@@ -120,11 +125,19 @@ class ExperimentConfig:
         return self
 
     def use_full_experiment_settings(self) -> None:
-        """Disable prototype caps for the full lab run (all data, long context)."""
+        """Disable prototype caps and saturate an A100 GPU for the full lab run."""
         self.prototype_mode = False
         self.max_seq_length = 4096
         self.max_train_samples = None
-        self.gradient_accumulation_steps = 4
+        # Per-device batch 8 + grad_accum 1 → effective batch 8; fills A100 VRAM for a 1.5B LoRA
+        # model and avoids the 4 sequential micro-step overhead of the prototype batch_size=1 default.
+        self.batch_size = 8
+        self.gradient_accumulation_steps = 1
+        # Batched generation: pass 16 prefixes at once to model.generate() instead of 1 at a time.
+        self.eval_batch_size = 16
+        # Parallel CPU tokenisation workers (safe on Linux/CUDA servers; keep 0 on Mac/MPS).
+        self.tokenize_num_workers = 4
+        self.dataloader_num_workers = 4
         self.max_steps = None
         self.save_steps = 200
         self.logging_steps = 10
@@ -182,6 +195,8 @@ def speed_settings_dict(config: ExperimentConfig) -> dict[str, Any]:
         "attn_implementation": config.attn_implementation,
         "auto_mps_throughput": config.auto_mps_throughput,
         "dataloader_num_workers": config.dataloader_num_workers,
+        "eval_batch_size": config.eval_batch_size,
+        "tokenize_num_workers": config.tokenize_num_workers,
         "max_new_tokens (eval gen)": config.max_new_tokens,
         "max_eval_samples": config.max_eval_samples,
         "benign_num_train_epochs": config.benign_num_train_epochs,

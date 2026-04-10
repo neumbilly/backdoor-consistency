@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,19 @@ def peft_eval_torch_device(config: Any) -> str:
     return "cpu"
 
 
+def _enable_kv_cache_for_eval(model: Any) -> bool:
+    """
+    Re-enable KV cache on the model config before generation; return the previous value.
+
+    Gradient checkpointing during training sets ``model.config.use_cache = False``.
+    Without restoring it before inference, every new token re-processes the full
+    prompt+context from scratch — O(N²) instead of O(N) generation.
+    """
+    original = bool(getattr(model.config, "use_cache", True))
+    model.config.use_cache = True
+    return original
+
+
 def load_backdoor_adapter_model(config: Any) -> tuple[Any, Any]:
     """
     Load base weights + LoRA adapter from ``{config.output_dir}/backdoor_baseline``.
@@ -90,6 +104,7 @@ def load_backdoor_adapter_model(config: Any) -> tuple[Any, Any]:
         )
     model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
+    model.config.use_cache = True  # re-enable KV cache disabled by gradient_checkpointing
     _move_peft_model_for_eval(model, config)
     return tokenizer, model
 
@@ -119,37 +134,73 @@ def load_peft_adapter_at_path(config: Any, adapter_dir: str | Path) -> tuple[Any
     )
     model = PeftModel.from_pretrained(model, str(adapter_path))
     model.eval()
+    model.config.use_cache = True  # re-enable KV cache disabled by gradient_checkpointing
     _move_peft_model_for_eval(model, config)
     return tokenizer, model
 
 
-def _encode_chat_prefix(
+def _generate_batch_assistant_turns(
+    model: Any,
     tokenizer: Any,
-    messages: list[dict[str, Any]],
+    messages_batch: list[list[dict[str, Any]]],
     max_seq_length: int,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    encoded = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-    else:
-        attention_mask = torch.ones_like(input_ids, device=device)
+    max_new_tokens: int,
+) -> list[str]:
+    """
+    Generate one assistant turn per prefix using a single batched ``model.generate()`` call.
 
-    seq_len = input_ids.shape[1]
-    if seq_len > max_seq_length:
-        drop = seq_len - max_seq_length
-        input_ids = input_ids[:, drop:]
-        attention_mask = attention_mask[:, drop:]
+    Uses **left-padding** — required for generation so the real prompt tokens sit at the
+    right edge of each row and the model attends to them contiguously.  All rows are padded
+    to the same length, so generated tokens start at the same offset in every output row.
+    """
+    if not messages_batch:
+        return []
 
-    return {"input_ids": input_ids, "attention_mask": attention_mask}
+    device = next(model.parameters()).device
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    # Tokenise each prefix individually (they may differ in length).
+    all_ids: list[list[int]] = []
+    for messages in messages_batch:
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )
+        ids = list(encoded["input_ids"])
+        if len(ids) > max_seq_length:
+            ids = ids[-max_seq_length:]  # left-truncate to keep most-recent context
+        all_ids.append(ids)
+
+    # Left-pad every row to the longest sequence in this batch.
+    max_prompt_len = max(len(ids) for ids in all_ids)
+    batch_input_ids: list[list[int]] = []
+    batch_attn_mask: list[list[int]] = []
+    for ids in all_ids:
+        pad_len = max_prompt_len - len(ids)
+        batch_input_ids.append([pad_id] * pad_len + ids)
+        batch_attn_mask.append([0] * pad_len + [1] * len(ids))
+
+    input_ids_t = torch.tensor(batch_input_ids, dtype=torch.long, device=device)
+    attn_mask_t = torch.tensor(batch_attn_mask, dtype=torch.long, device=device)
+
+    gen_cfg = build_greedy_eval_generation_config(model, tokenizer, max_new_tokens)
+    with torch.inference_mode():
+        out = model.generate(
+            input_ids=input_ids_t,
+            attention_mask=attn_mask_t,
+            generation_config=gen_cfg,
+        )
+
+    # out shape: [batch, max_prompt_len + n_generated_tokens]
+    # Generated tokens start at max_prompt_len for every row (uniform left-padded prompt).
+    return [
+        tokenizer.decode(out[i, max_prompt_len:], skip_special_tokens=True).strip()
+        for i in range(len(messages_batch))
+    ]
 
 
 def _generate_one_assistant_turn(
@@ -159,15 +210,10 @@ def _generate_one_assistant_turn(
     max_seq_length: int,
     max_new_tokens: int,
 ) -> str:
-    device = next(model.parameters()).device
-    inputs = _encode_chat_prefix(tokenizer, messages, max_seq_length, device)
-    gen_cfg = build_greedy_eval_generation_config(model, tokenizer, max_new_tokens)
-
-    with torch.inference_mode():
-        out = model.generate(**inputs, generation_config=gen_cfg)
-    prompt_len = inputs["input_ids"].shape[1]
-    gen_ids = out[0, prompt_len:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    """Single-sequence wrapper around the batched helper (used by trigger_optimization.py)."""
+    return _generate_batch_assistant_turns(
+        model, tokenizer, [messages], max_seq_length, max_new_tokens
+    )[0]
 
 
 def load_backdoor_test_prefixes(
@@ -214,6 +260,9 @@ def evaluate_backdoor_tpr_fpr(
     - **Without trigger**: same prefix unchanged; success if substring appears (FP / TN).
 
     TPR = TP / (TP + FN), FPR = FP / (FP + TN).
+
+    Uses ``config.eval_batch_size`` batched generation for GPU throughput, and
+    re-enables the KV cache (fixes the O(N²) generation bug from gradient_checkpointing).
     """
     path = Path(test_path or config.backdoor_test_file)
     trig = trigger if trigger is not None else config.base_trigger
@@ -227,6 +276,8 @@ def evaluate_backdoor_tpr_fpr(
     )
     max_len = int(getattr(config, "max_seq_length", 4096))
     max_new = int(getattr(config, "max_new_tokens", 256))
+    eval_bs = max(1, int(getattr(config, "eval_batch_size", 1)))
+
     if test_trajectory_limit is _USE_CONFIG_MAX_EVAL_SAMPLES:
         cap = getattr(config, "max_eval_samples", None)
     else:
@@ -236,36 +287,45 @@ def evaluate_backdoor_tpr_fpr(
     if cap is not None and cap > 0:
         prefixes = prefixes[: int(cap)]
 
-    model.eval()
+    n_batches = math.ceil(len(prefixes) / eval_bs) if prefixes else 0
     actual_positive: list[bool] = []
     predicted_positive: list[bool] = []
 
     try:
-        from tqdm.auto import tqdm
+        from tqdm.auto import tqdm as _tqdm
+        _has_tqdm = True
     except ImportError:
-        tqdm = None  # type: ignore[assignment]
+        _has_tqdm = False
 
-    iterator = prefixes
-    if tqdm is not None:
-        iterator = tqdm(prefixes, desc="backdoor eval")
+    # Re-enable KV cache for O(N) generation; save the current value to restore afterward.
+    # Gradient checkpointing during training sets use_cache=False on the model config and
+    # the same model object is passed directly into eval, so it stays disabled unless fixed here.
+    _orig_use_cache = _enable_kv_cache_for_eval(model)
+    model.eval()
 
-    for messages in iterator:
-        triggered = build_backdoored_record(
-            {"messages": messages},
-            trigger=trig,
-            index=idx,
-        )["messages"]
-        gen_t = _generate_one_assistant_turn(
-            model, tokenizer, triggered, max_len, max_new
-        )
-        gen_c = _generate_one_assistant_turn(
-            model, tokenizer, messages, max_len, max_new
-        )
+    try:
+        batch_starts: Any = range(0, len(prefixes), eval_bs)
+        if _has_tqdm:
+            batch_starts = _tqdm(batch_starts, total=n_batches, desc=f"backdoor eval (bs={eval_bs})")
 
-        actual_positive.append(True)
-        predicted_positive.append(sub.strip() in gen_t)
-        actual_positive.append(False)
-        predicted_positive.append(sub.strip() in gen_c)
+        for batch_start in batch_starts:
+            batch = prefixes[batch_start : batch_start + eval_bs]
+
+            triggered_batch = [
+                build_backdoored_record({"messages": m}, trigger=trig, index=idx)["messages"]
+                for m in batch
+            ]
+
+            gens_t = _generate_batch_assistant_turns(model, tokenizer, triggered_batch, max_len, max_new)
+            gens_c = _generate_batch_assistant_turns(model, tokenizer, batch, max_len, max_new)
+
+            for gen_t, gen_c in zip(gens_t, gens_c):
+                actual_positive.append(True)
+                predicted_positive.append(sub.strip() in gen_t)
+                actual_positive.append(False)
+                predicted_positive.append(sub.strip() in gen_c)
+    finally:
+        model.config.use_cache = _orig_use_cache
 
     counts = summarize_detection_metrics(predicted_positive, actual_positive)
     n_t = len(prefixes)
@@ -280,5 +340,5 @@ def evaluate_backdoor_tpr_fpr(
         n_without_trigger=n_t,
         success_substring=sub,
         test_file=str(path),
-        notes=f"Evaluated {n_t} trajectories x2 (trigger / clean).",
+        notes=f"Evaluated {n_t} trajectories x2 (trigger/clean), batch_size={eval_bs}.",
     )
