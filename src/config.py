@@ -129,12 +129,12 @@ class ExperimentConfig:
         self.prototype_mode = False
         self.max_seq_length = 4096
         self.max_train_samples = None
-        # Per-device batch 8 + grad_accum 1 → effective batch 8; fills A100 VRAM for a 1.5B LoRA
-        # model and avoids the 4 sequential micro-step overhead of the prototype batch_size=1 default.
-        self.batch_size = 8
-        self.gradient_accumulation_steps = 1
-        # Batched generation: pass 16 prefixes at once to model.generate() instead of 1 at a time.
-        self.eval_batch_size = 16
+        # Per-device batch 4 + grad_accum 2 → effective batch 8 (same as before) with lower peak VRAM.
+        # Batch 8×4096 on a 40GB A100 often sits at ~39GB and OOMs; this leaves headroom.
+        self.batch_size = 4
+        self.gradient_accumulation_steps = 2
+        # Smaller eval batches reduce peak memory during batched generation (still much faster than 1).
+        self.eval_batch_size = 8
         # Parallel CPU tokenisation workers (safe on Linux/CUDA servers; keep 0 on Mac/MPS).
         self.tokenize_num_workers = 4
         self.dataloader_num_workers = 4
